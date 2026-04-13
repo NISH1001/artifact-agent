@@ -45,6 +45,7 @@ class ToolSpec:
     name: str
     description: str
     parameters: list[ParamSpec] = field(default_factory=list)
+    capabilities: list[str] = field(default_factory=list)
     body: str = ""  # markdown below frontmatter
     extra_docs: dict[str, str] = field(default_factory=dict)
     tool_dir: Path | None = None
@@ -77,25 +78,37 @@ def parse_tool_spec(tool_dir: Path) -> ToolSpec | None:
         name=raw["name"],
         description=raw.get("description", ""),
         parameters=params,
+        capabilities=raw.get("capabilities", []) or [],
         body=parts[2].strip(),
         extra_docs=extra_docs,
         tool_dir=tool_dir,
     )
 
 
-# ── Monty validation ────────────────────────────────────────────────
+# ── Capability registry ────────────────────────────────────────────
+#
+# Tools declare capabilities they need (e.g. "http"). Each capability bundles:
+#   - stubs:    type stubs Monty uses to type-check the generated code
+#   - mock_fn:  async fn injected during validation (returns mock data)
+#   - runtime_fn: async fn injected at runtime (real implementation)
+#
+# To add a new capability (e.g. file_read, time, etc.), add a single entry below.
+# Tool specs reference capabilities by name in their YAML frontmatter:
+#   capabilities: [http]
 
-# Type stubs for external functions — Monty uses these for type checking
-HTTP_STUBS = """\
-from typing import Any
 
-async def http_request(method: str, url: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> str:
-    raise NotImplementedError()
-"""
+@dataclass
+class Capability:
+    """Bundles type stubs, mock impl, and runtime impl for one external function."""
+
+    name: str  # the function name the generated code calls (e.g. "http_request")
+    stubs: str  # type stub string for Monty type-check
+    mock_fn: Any  # async fn used during validation
+    runtime_fn: Any  # async fn used in production
 
 
 def _mock_http_response() -> str:
-    """Generic mock JSON response. Enough to let parsing code execute."""
+    """Generic mock JSON response. Enough to let parsing/formatting code execute."""
     return json.dumps(
         {
             "items": [
@@ -118,8 +131,81 @@ def _mock_http_response() -> str:
     )
 
 
+async def _mock_http_request(method, url, params, headers=None):
+    return _mock_http_response()
+
+
+async def _real_http_request(
+    method: str, url: str, params: dict, headers: dict | None = None
+) -> str:
+    """Real HTTP implementation injected into generated code at runtime."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.request(method, url, params=params, headers=headers or {})
+        resp.raise_for_status()
+        return resp.text
+
+
+CAPABILITIES: dict[str, Capability] = {
+    "http": Capability(
+        name="http_request",
+        stubs="""\
+from typing import Any
+
+async def http_request(method: str, url: str, params: dict[str, Any], headers: dict[str, str] | None = None) -> str:
+    raise NotImplementedError()
+""",
+        mock_fn=_mock_http_request,
+        runtime_fn=_real_http_request,
+    ),
+    # Add new capabilities here. Examples:
+    #   "time": Capability(name="now", stubs=..., mock_fn=..., runtime_fn=...),
+    #   "file_read": Capability(name="read_file", stubs=..., mock_fn=..., runtime_fn=...),
+}
+
+
+def _capability_stubs(capabilities: list[str]) -> str:
+    """Concatenate type stubs for the requested capabilities."""
+    parts = []
+    for cap_name in capabilities:
+        cap = CAPABILITIES.get(cap_name)
+        if cap is None:
+            logger.warning("[ToolBuild] unknown capability: {}", cap_name)
+            continue
+        parts.append(cap.stubs)
+    return "\n".join(parts)
+
+
+def _capability_externals(capabilities: list[str]) -> dict[str, Any]:
+    """Build the external_functions dict for Monty validation."""
+    externals = {}
+    for cap_name in capabilities:
+        cap = CAPABILITIES.get(cap_name)
+        if cap is None:
+            continue
+        externals[cap.name] = cap.mock_fn
+    return externals
+
+
+def _capability_runtime(capabilities: list[str]) -> dict[str, Any]:
+    """Build the namespace injections for runtime exec()."""
+    runtime = {}
+    for cap_name in capabilities:
+        cap = CAPABILITIES.get(cap_name)
+        if cap is None:
+            continue
+        runtime[cap.name] = cap.runtime_fn
+    return runtime
+
+
+# ── Monty validation ────────────────────────────────────────────────
+
+
 async def validate_with_monty(code: str, spec: ToolSpec) -> str | None:
-    """Validate generated code in Monty sandbox. Returns None if valid, error str if not."""
+    """Validate generated code in Monty sandbox. Returns None if valid, error str if not.
+
+    Stubs and external functions are dynamically assembled from the spec's declared
+    capabilities. Pure-compute tools (no capabilities) validate as plain Python.
+    """
     # Build test inputs for required params
     test_args = {}
     for p in spec.parameters:
@@ -131,24 +217,22 @@ async def validate_with_monty(code: str, spec: ToolSpec) -> str | None:
     args_str = ", ".join(f"{k}={v!r}" for k, v in test_args.items())
     wrapper = f"{code}\n\nawait {spec.name}({args_str})\n"
 
+    stubs = _capability_stubs(spec.capabilities)
+    externals = _capability_externals(spec.capabilities)
+
     try:
         m = pydantic_monty.Monty(
             wrapper,
             type_check=True,
-            type_check_stubs=HTTP_STUBS,
+            type_check_stubs=stubs if stubs else None,
         )
     except pydantic_monty.MontySyntaxError as e:
         return f"SyntaxError: {e}"
     except pydantic_monty.MontyTypingError as e:
         return f"TypeError: {e}"
 
-    mock = _mock_http_response()
-
-    async def http_request(method, url, params, headers=None):
-        return mock
-
     try:
-        result = await m.run_async(external_functions={"http_request": http_request})
+        result = await m.run_async(external_functions=externals)
         logger.debug("[ToolBuild] Monty result preview: {}", repr(result)[:120])
         return None
     except pydantic_monty.MontyRuntimeError as e:
@@ -165,13 +249,10 @@ You are a tool code generator. Given a tool design spec, generate a single async
 Rules:
 - Function must be async, with parameters matching the spec's `parameters`.
 - Return type must be str.
-- For HTTP calls, use `await http_request(method, url, params, headers)` — it is an external function provided by the runtime. DO NOT import or define it.
-  - `params` must be a dict of query-string params (values can be str or int)
-  - `headers` is optional (dict[str, str])
-  - Returns the response body as a string
-- You may `import json` for parsing. NO other imports allowed (no httpx, no os, no requests, etc).
-- Handle null/missing fields gracefully — fall back to "n/a".
 - Format the output as a human-readable string, following the spec's "Output format" section.
+- Handle null/missing fields gracefully — fall back to "n/a".
+- You may `import json` for parsing. NO other imports allowed (no httpx, no os, no requests, etc).
+- For external I/O (HTTP, file reads, time, etc.), use ONLY the external functions listed in the prompt's "Available capabilities" section. DO NOT import or define them. If no capabilities are listed, write pure Python — no I/O at all.
 - Do NOT wrap code in markdown fences. Return raw Python code only.
 
 After generating code, call `validate_code(code)` to check it. If the result is not "valid", read the error, fix the code, and validate again. Keep iterating until valid, then return the final code.
@@ -184,7 +265,7 @@ class CodegenDeps:
 
 
 codegen_agent = Agent(
-    "openai:gpt-5-nano",
+    "openai:gpt-5.4-nano",
     system_prompt=CODEGEN_SYSTEM_PROMPT,
     deps_type=CodegenDeps,
     output_type=str,
@@ -209,6 +290,22 @@ def _spec_prompt(spec: ToolSpec) -> str:
         req = " (required)" if p.required else ""
         default = f", default={p.default!r}" if p.default is not None else ""
         lines.append(f"- {p.name}: {p.type}{req}{default} — {p.description}")
+
+    # Available capabilities — what external functions the generated code can use
+    lines.append("")
+    lines.append("## Available capabilities")
+    if spec.capabilities:
+        for cap_name in spec.capabilities:
+            cap = CAPABILITIES.get(cap_name)
+            if cap is None:
+                lines.append(f"- (unknown capability: {cap_name})")
+                continue
+            lines.append(f"### {cap_name}")
+            lines.append("```python")
+            lines.append(cap.stubs.strip())
+            lines.append("```")
+    else:
+        lines.append("(none — this is a pure compute tool. No external functions, no I/O.)")
 
     lines.append("")
     lines.append("## Spec body")
@@ -276,19 +373,10 @@ def _write_cache(path: Path, code: str, hash_val: str) -> None:
 TYPE_MAP = {"string": str, "integer": int, "number": float, "boolean": bool}
 
 
-async def _real_http_request(
-    method: str, url: str, params: dict, headers: dict | None = None
-) -> str:
-    """Real HTTP implementation injected into generated code at runtime."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.request(method, url, params=params, headers=headers or {})
-        resp.raise_for_status()
-        return resp.text
-
-
 def _make_callable(code: str, spec: ToolSpec):
-    """exec the generated code, inject real http_request, synthesize signature for FastMCP."""
-    namespace: dict = {"http_request": _real_http_request, "json": json}
+    """exec the generated code, inject capability runtime impls, synthesize signature for FastMCP."""
+    namespace: dict = {"json": json}
+    namespace.update(_capability_runtime(spec.capabilities))
     exec(code, namespace)
     fn = namespace[spec.name]
 
