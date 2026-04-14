@@ -1,4 +1,4 @@
-# artifact-agent
+# ada — Artifact-Driven Agent
 
 An agent whose **behavior and tools are entirely defined by markdown artifacts**. Swap the artifacts directory — get a completely different agent. Zero code changes.
 
