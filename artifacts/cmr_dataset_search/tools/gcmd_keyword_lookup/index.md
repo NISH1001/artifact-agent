@@ -6,7 +6,7 @@ parameters:
   - name: concept_scheme
     required: true
     type: string
-    description: "One of: sciencekeywords, instruments, platforms"
+    description: "One of: sciencekeywords, instruments, platforms. Normalize input — accept variations like science_keywords, GCMD, Science Keywords etc. and map to the canonical form."
   - name: query_term
     required: true
     type: string

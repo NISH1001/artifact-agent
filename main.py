@@ -25,12 +25,18 @@ async def main():
         action="store_true",
         help="Enable chat mode for multi-turn conversations",
     )
+    parser.add_argument(
+        "--model",
+        default="openai:gpt-5-nano",
+        help="Model to use for the main agent (default: openai:gpt-5-nano)",
+    )
     args = parser.parse_args()
 
     artifact_dir = Path(args.artifacts)
     logger.info("Query: {}", args.query)
+    logger.info("Model: {}", args.model)
 
-    agent, store = await create_agent(artifact_dir)
+    agent, store = await create_agent(artifact_dir, model=args.model)
 
     result = await agent.run(args.query, deps=store)
     print("\n" + result.output)

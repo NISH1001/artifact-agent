@@ -41,7 +41,7 @@ logging.basicConfig(handlers=[_InterceptHandler()], level=logging.INFO, force=Tr
 
 
 async def create_agent(
-    artifact_dir: Path, builder: ToolBuilder | None = None
+    artifact_dir: Path, builder: ToolBuilder | None = None, model: str = "openai:gpt-5-nano",
 ) -> tuple[Agent, ArtifactStore]:
     """Create an agent with dynamically generated tools from the artifact directory."""
     store = ArtifactStore(root=artifact_dir)
@@ -58,7 +58,7 @@ async def create_agent(
         logger.warning("[Agent] no dynamic tools built — agent will have only load_artifact")
 
     agent = Agent(
-        "openai:gpt-5.2",
+        model,
         deps_type=ArtifactStore,
         toolsets=toolsets,
     )
