@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -62,8 +63,19 @@ class ToolBuilder:
 
     @staticmethod
     def _make_callable(code: str, spec: ToolSpec) -> Callable:
-        """exec() the generated code with runtime affordances injected, synthesize signature."""
-        namespace: dict[str, Any] = {"json": json}
+        """exec() the generated code with runtime affordances injected, synthesize signature.
+
+        Injects Path and artifacts_root so generated code can read data files
+        relative to the artifacts directory (e.g. Path(artifacts_root / 'contexts/gcmd.json')).
+        """
+        # artifacts_root is two levels up from tool_dir: tools/<name> -> tools -> root
+        artifacts_root = spec.tool_dir.parent.parent if spec.tool_dir else Path(".")
+        namespace: dict[str, Any] = {
+            "json": json,
+            "Path": Path,
+            "artifacts_root": artifacts_root,
+            "env": os.environ,
+        }
         namespace.update(runtime_for(spec.affordances))
         exec(code, namespace)
         fn = namespace[spec.name]
@@ -72,12 +84,11 @@ class ToolBuilder:
         orig_fn = fn
 
         async def logged_fn(**kwargs):
-            logger.info(
-                "[ToolCall] {}({})",
-                spec.name,
-                ", ".join(f"{k}={v!r}" for k, v in kwargs.items()),
-            )
-            return await orig_fn(**kwargs)
+            logger.info("[ToolCall] {}({})", spec.name, ", ".join(f"{k}={v!r}" for k, v in kwargs.items()))
+            result = await orig_fn(**kwargs)
+            preview = result.replace("\n", " ")[:300] + ("..." if len(result) > 300 else "")
+            logger.debug("[ToolResult] {} → {}", spec.name, preview)
+            return result
 
         # Synthesize signature for FastMCP schema
         params = []

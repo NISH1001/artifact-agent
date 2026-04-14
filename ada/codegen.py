@@ -11,11 +11,13 @@ external_functions and type_check_stubs. No custom registry class.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 import pydantic_monty
 from loguru import logger
+from pydantic_monty import MemoryFile, OSAccess
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 
@@ -67,6 +69,8 @@ async def _real_http_request(
         resp.raise_for_status()
         return resp.text
 
+
+# ── Affordance dicts ──────────────────────────────────────────────
 
 # Maps affordance name → type stub for Monty type-checking
 MONTY_STUBS: dict[str, str] = {
@@ -128,6 +132,30 @@ def runtime_for(affordances: list[str]) -> dict[str, Any]:
 # ── Monty validation ──────────────────────────────────────────────────
 
 
+def _build_os_access(spec: ToolSpec) -> OSAccess | None:
+    """If the tool's artifact directory (or parent artifacts dir) has data files,
+    load them into Monty's OSAccess so generated code can read them during validation."""
+    if spec.tool_dir is None:
+        return None
+
+    # Collect data files from the artifacts root (two levels up: tools/<name> -> tools -> root)
+    artifacts_root = spec.tool_dir.parent.parent
+    data_files = []
+    for f in artifacts_root.rglob("*"):
+        if f.is_file() and f.suffix in (".json", ".csv", ".txt", ".yaml", ".yml"):
+            virtual_path = str(f.relative_to(artifacts_root))
+            try:
+                content = f.read_text()
+                data_files.append(MemoryFile(f"/{virtual_path}", content))
+                logger.debug("[ToolBuild] OSAccess: mounted /{}", virtual_path)
+            except Exception:
+                pass  # skip unreadable files
+
+    if not data_files:
+        return None
+    return OSAccess(data_files)
+
+
 async def validate_with_monty(code: str, spec: ToolSpec) -> str | None:
     """Validate generated code in Monty sandbox. Returns None if valid, error string if not."""
     # Build test call with required params
@@ -143,20 +171,35 @@ async def validate_with_monty(code: str, spec: ToolSpec) -> str | None:
 
     stubs = stubs_for(spec.affordances)
     externals = mocks_for(spec.affordances)
+    os_access = _build_os_access(spec)
+
+    # Declare runtime globals so Monty's type checker accepts them
+    runtime_stubs = (
+        "from pathlib import Path\n"
+        "artifacts_root: Path\n"
+        "env: dict[str, str]\n"
+    )
+    all_stubs = runtime_stubs + ("\n" + stubs if stubs else "")
 
     try:
         m = pydantic_monty.Monty(
             wrapper,
             type_check=True,
-            type_check_stubs=stubs if stubs else None,
+            type_check_stubs=all_stubs,
+            inputs=["artifacts_root", "env"],
         )
     except pydantic_monty.MontySyntaxError as e:
         return f"SyntaxError: {e}"
     except pydantic_monty.MontyTypingError as e:
         return f"TypeError: {e}"
+    except (NotImplementedError, Exception) as e:
+        return f"{type(e).__name__}: {e}"
+
+    # In Monty: artifacts_root is "/" (matches OSAccess mounts), env is empty (no real keys in sandbox)
+    inputs = {"artifacts_root": Path("/"), "env": {}}
 
     try:
-        result = await m.run_async(external_functions=externals)
+        result = await m.run_async(external_functions=externals, os=os_access, inputs=inputs)
         logger.debug("[ToolBuild] Monty result preview: {}", repr(result)[:120])
         return None
     except pydantic_monty.MontyRuntimeError as e:
@@ -175,7 +218,9 @@ Rules:
 - Format the output as a human-readable string, following the spec's "Output format" section if present.
 - Handle null/missing fields gracefully — fall back to "n/a".
 - You may `import json` for parsing. NO other imports allowed (no httpx, no os, no requests, etc).
-- For external I/O (HTTP, file reads, time, etc.), use ONLY the external functions listed in the prompt's "Available affordances" section. DO NOT import or define them. If no affordances are listed, write pure Python — no I/O at all.
+- For external I/O (HTTP calls, etc.), use ONLY the external functions listed in the prompt's "Available affordances" section. DO NOT import or define them.
+- For reading data files, `Path` (from pathlib) and `artifacts_root` (a Path to the artifacts directory) are available in scope. Use `Path(artifacts_root / 'relative/path').read_text()` to read files referenced in the spec.
+- For environment variables, `env` (a dict-like object) is available in scope. Use `env.get('<VAR_NAME>', '')` to read env vars referenced in the spec.
 - Do NOT wrap code in markdown fences. Return raw Python code only.
 
 If the spec provides explicit parameters, use them exactly. If the spec is prose-only (no explicit parameters), infer the function name and parameters from the description.
@@ -198,7 +243,7 @@ def _get_codegen_agent() -> Agent[CodegenDeps, str]:
         return _codegen_agent
 
     agent = Agent(
-        "openai:gpt-5.4-nano",
+        "openai:gpt-5.2",
         system_prompt=CODEGEN_SYSTEM_PROMPT,
         deps_type=CodegenDeps,
         output_type=str,

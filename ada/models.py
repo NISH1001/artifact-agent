@@ -48,7 +48,7 @@ class ToolSpec(BaseModel):
         if self.tool_dir is None:
             return hashlib.sha256(self.body.encode()).hexdigest()[:12]
         content = ""
-        for md in sorted(self.tool_dir.glob("*.md")):
+        for md in sorted(self.tool_dir.rglob("*.md")):
             content += md.read_text()
         return hashlib.sha256(content.encode()).hexdigest()[:12]
 
@@ -65,11 +65,12 @@ class ToolSpec(BaseModel):
 
         content = index_file.read_text()
 
-        # Collect extra docs from sibling .md files
+        # Collect extra docs from all .md files in the tool directory (recursive)
         extra_docs = {}
-        for md in sorted(tool_dir.glob("*.md")):
+        for md in sorted(tool_dir.rglob("*.md")):
             if md.name != "index.md":
-                extra_docs[md.name] = md.read_text()
+                key = str(md.relative_to(tool_dir))
+                extra_docs[key] = md.read_text()
 
         # Try to parse YAML frontmatter
         parts = content.split("---", 2)
